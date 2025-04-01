@@ -36,7 +36,7 @@ current_job_finish_time = None
 MAX_TEXT_TASK_HOURS = int(os.getenv("MAX_TEXT_TASK_HOURS", "12"))
 MAX_IMAGE_TASK_HOURS = int(os.getenv("MAX_IMAGE_TASK_HOURS", "3"))
 # Track acceptable model families
-ACCEPTED_MODEL_FAMILIES = os.getenv("ACCEPTED_MODEL_FAMILIES", "llama,mistral").lower().split(",")
+ACCEPTED_MODEL_FAMILIES = os.getenv("ACCEPTED_MODEL_FAMILIES", "llama,mistral,qwen,samoline").lower().split(",")
 # Track queue capacity
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "5"))
 

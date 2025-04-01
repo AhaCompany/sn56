@@ -58,6 +58,25 @@ MODEL_CONFIGS = {
         "eval_steps": 50,
         "save_steps": 100,
     },
+    "qwen": {
+        "flash_attention": True,  # Qwen2.5 supports flash attention
+        "batch_size": 8,         # Smaller models can use larger batch sizes
+        "gradient_accumulation_steps": 2,
+        "learning_rate_scheduler": "cosine",
+        "warmup_steps": 50,
+        "eval_steps": 50,
+        "save_steps": 100,
+    },
+    "samoline": {
+        "flash_attention": True,  # Try flash attention for samoline models
+        "batch_size": 4,
+        "gradient_accumulation_steps": 4,
+        "learning_rate_scheduler": "cosine",
+        "warmup_steps": 100,
+        "eval_steps": 50,
+        "save_steps": 100,
+        "load_in_8bit": False,   # Avoid quantization for unknown models
+    },
     "sdxl": {
         "train_batch_size": 4,
         "max_train_steps": 1500,

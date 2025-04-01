@@ -64,18 +64,34 @@ class PriorityJobQueue:
     def get_model_family(self, model_name: str) -> str:
         """Extract model family from model name."""
         model_lower = model_name.lower()
+        
+        # Check for known model families
         if "llama" in model_lower:
             return "llama"
         elif "mistral" in model_lower:
             return "mistral"
         elif "phi" in model_lower:
             return "phi"
+        elif "qwen" in model_lower:
+            return "qwen"
         elif "stable-diffusion" in model_lower:
             return "stable-diffusion"
         elif "sdxl" in model_lower:
             return "sdxl"
-        else:
-            return "other"
+        elif "samoline" in model_lower:
+            return "samoline"
+        
+        # Special handling for potential custom models 
+        # Example: samoline/96521fc8-4ac9-47b0-b203-231ae221afec
+        splits = model_lower.split('/')
+        if len(splits) > 1:
+            org = splits[0]
+            # If organization matches our special cases, assign specific family
+            if org == "samoline":
+                return "samoline"
+        
+        # Default for unknown models
+        return "other"
             
     def update_model_family_stats(self, job_id: str, model: str, success: bool, loss: Optional[float] = None):
         """Update statistics for model families based on job results."""
