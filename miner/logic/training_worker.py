@@ -286,33 +286,56 @@ class TrainingWorker:
             try:
                 # Check if any jobs are stuck
                 with self.lock:
-                    for job_id, job in self.job_store.items():
-                        # If a job has been in PROCESSING state for more than 1 hour, something might be wrong
-                        if (job.status == JobStatus.PROCESSING and 
-                            job_id in self.job_queue.running_jobs and
-                            time.time() - self.job_queue.running_jobs[job_id]["start_time"] > 3600):
+                    try:
+                        for job_id, job in list(self.job_store.items()):  # Use list() to safely iterate
+                            # Safely check job status
+                            status = getattr(job, 'status', None)
+                            # Check if job is in running_jobs dictionary
+                            is_in_running_jobs = job_id in self.job_queue.running_jobs
                             
-                            stuck_msg = f"Job {job_id} appears to be stuck in PROCESSING state for >1 hour"
-                            log_diagnostic(stuck_msg, "WARNING")
-                            logger.warning(stuck_msg)
+                            # If we can't get the status, log and continue
+                            if status is None:
+                                log_diagnostic(f"Job {job_id} has no status attribute", "WARNING")
+                                continue
+                                
+                            # Convert status to string for comparison if it's not already a string
+                            status_str = str(status)
                             
-                            # Attempt to fix the situation
-                            try:
-                                # Reset active jobs count if needed
-                                if self.active_jobs > 0:
-                                    reset_msg = f"Resetting active_jobs count from {self.active_jobs} to 0"
-                                    log_diagnostic(reset_msg, "WARNING")
-                                    logger.warning(reset_msg)
-                                    self.active_jobs = 0
-                                    
-                                # Release semaphore if needed
-                                self.job_semaphore.release()
-                                log_diagnostic("Released job semaphore to unblock worker threads", "WARNING")
-                                logger.warning("Released job semaphore to unblock worker threads")
-                            except Exception as e:
-                                error_msg = f"Error resetting worker state: {e}"
-                                log_diagnostic(error_msg, "ERROR", include_trace=True)
-                                logger.error(error_msg)
+                            # If a job has been in PROCESSING state for more than 1 hour, something might be wrong
+                            if (status_str == "PROCESSING" or status_str == JobStatus.PROCESSING and 
+                                is_in_running_jobs and
+                                time.time() - self.job_queue.running_jobs[job_id]["start_time"] > 3600):
+                                
+                                stuck_msg = f"Job {job_id} appears to be stuck in {status_str} state for >1 hour"
+                                log_diagnostic(stuck_msg, "WARNING")
+                                logger.warning(stuck_msg)
+                                
+                                # Attempt to fix the situation
+                                try:
+                                    # Reset active jobs count if needed
+                                    if self.active_jobs > 0:
+                                        reset_msg = f"Resetting active_jobs count from {self.active_jobs} to 0"
+                                        log_diagnostic(reset_msg, "WARNING")
+                                        logger.warning(reset_msg)
+                                        self.active_jobs = 0
+                                        
+                                    # Release semaphore if needed
+                                    try:
+                                        self.job_semaphore.release()
+                                        log_diagnostic("Released job semaphore to unblock worker threads", "WARNING")
+                                        logger.warning("Released job semaphore to unblock worker threads")
+                                    except ValueError:
+                                        # If semaphore was already at max value, a ValueError will be raised
+                                        log_diagnostic("Semaphore already at max value, no release needed", "WARNING")
+                                        
+                                except Exception as e:
+                                    error_msg = f"Error resetting worker state: {e}"
+                                    log_diagnostic(error_msg, "ERROR", include_trace=True)
+                                    logger.error(error_msg)
+                    except Exception as e:
+                        error_msg = f"Error while checking job status: {e}"
+                        log_diagnostic(error_msg, "ERROR", include_trace=True)
+                        logger.error(error_msg)
                 
                 # Check if worker threads are alive, restart if needed
                 for i, thread in enumerate(self.threads):
@@ -330,7 +353,7 @@ class TrainingWorker:
                 # Sleep for 5 minutes before checking again
                 time.sleep(300)
             except Exception as e:
-                error_msg = f"Error in watchdog thread: {e}"
+                error_msg = f"Error in watchdog thread: {str(e)}"
                 log_diagnostic(error_msg, "ERROR", include_trace=True)
                 logger.error(error_msg)
                 time.sleep(60)  # Sleep for a minute if there's an error
