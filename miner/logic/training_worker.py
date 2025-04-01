@@ -59,7 +59,10 @@ class PriorityJobQueue:
         self.model_family_stats: Dict[str, Dict] = {}
         self.running_jobs: Dict[str, Dict] = {}
         self.lock = threading.RLock()  # Reentrant lock for thread safety
-        log_diagnostic(f"Initialized PriorityJobQueue", "INFO")
+        # Maximum time (in seconds) a job can run before being considered stuck
+        # Default is 8 hours (28800 seconds)
+        self.max_job_runtime = int(os.getenv("MAX_JOB_RUNTIME_SECONDS", "28800"))
+        log_diagnostic(f"Initialized PriorityJobQueue (max job runtime: {self.max_job_runtime} seconds)", "INFO")
         
     def get_model_family(self, model_name: str) -> str:
         """Extract model family from model name."""
@@ -336,13 +339,58 @@ class TrainingWorker:
                                         start_time = self.job_queue.running_jobs[job_id].get("start_time", 0)
                                         running_time = time.time() - start_time
                                         
-                                        # Check for stuck jobs (job in Running status for >1 hour)
+                                        # Check for stuck jobs based on their status and running time
                                         # Compare status with both string value "Running" and enum JobStatus.RUNNING
                                         is_running = (status_str == "Running" or 
                                                      status_str == str(JobStatus.RUNNING) or
                                                      (hasattr(job.status, "value") and job.status.value == "Running"))
                                         
-                                        if running_time > 3600 and is_running:
+                                        # Get max job runtime from the queue configuration
+                                        max_runtime = getattr(self.job_queue, 'max_job_runtime', 28800)  # Default 8 hours
+                                        
+                                        # Check if job has been running too long (default: 8 hours)
+                                        if running_time > max_runtime and is_running:
+                                            timeout_msg = f"Job {job_id} has exceeded maximum runtime of {max_runtime/3600:.1f} hours - terminating"
+                                            log_diagnostic(timeout_msg, "WARNING")
+                                            logger.warning(timeout_msg)
+                                            
+                                            # Mark job as failed due to timeout
+                                            try:
+                                                with self.lock:
+                                                    job.status = JobStatus.FAILED
+                                                    job.error_message = f"Job timed out after {running_time/3600:.1f} hours"
+                                                    
+                                                    # Remove from running_jobs
+                                                    if job_id in self.job_queue.running_jobs:
+                                                        del self.job_queue.running_jobs[job_id]
+                                                        
+                                                    # Reset active jobs if needed
+                                                    if self.active_jobs > 0:
+                                                        self.active_jobs = 0
+                                                        
+                                                    # Try to terminate any associated Docker containers
+                                                    try:
+                                                        docker_client = docker.from_env()
+                                                        containers = docker_client.containers.list()
+                                                        for container in containers:
+                                                            if job_id in container.name or job_id in str(container.labels):
+                                                                log_diagnostic(f"Terminating container for timed out job {job_id}", "WARNING")
+                                                                container.stop(timeout=10)
+                                                                container.remove(force=True)
+                                                    except Exception as docker_e:
+                                                        log_diagnostic(f"Error stopping containers for timed out job: {docker_e}", "ERROR")
+                                                        
+                                                    # Release semaphore to allow new jobs
+                                                    try:
+                                                        self.job_semaphore.release()
+                                                    except ValueError:
+                                                        # If semaphore was already at max value, ignore
+                                                        pass
+                                            except Exception as timeout_e:
+                                                log_diagnostic(f"Error handling job timeout: {timeout_e}", "ERROR", include_trace=True)
+                                                
+                                        # Also keep the 1-hour check for early warning
+                                        elif running_time > 3600 and is_running:
                                             stuck_msg = f"Job {job_id} appears to be stuck in {status_str} state for >{int(running_time/60)} minutes"
                                             log_diagnostic(stuck_msg, "WARNING")
                                             logger.warning(stuck_msg)

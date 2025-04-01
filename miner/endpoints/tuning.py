@@ -106,26 +106,88 @@ async def tune_model_diffusion(
     return {"message": "Training job enqueued.", "task_id": job.job_id}
 
 
-async def get_latest_model_submission(task_id: str) -> str:
+async def get_latest_model_submission(
+    task_id: str,
+    worker_config: WorkerConfig = Depends(get_worker_config)
+) -> str:
+    # First check if job is in our job store and still in progress
+    job = None
+    job_status = None
+    
     try:
+        # Check if job exists in job_store
+        if hasattr(worker_config.trainer, 'job_store') and task_id in worker_config.trainer.job_store:
+            job = worker_config.trainer.job_store[task_id]
+            job_status = getattr(job, 'status', None)
+            
+            # If job is still in QUEUED or RUNNING state, inform validator
+            if job_status == JobStatus.QUEUED:
+                logger.info(f"Validator requested result for job {task_id} which is still in queue")
+                raise HTTPException(
+                    status_code=202, 
+                    detail=f"Job {task_id} is in queue and has not started processing yet"
+                )
+            elif job_status == JobStatus.RUNNING:
+                logger.info(f"Validator requested result for job {task_id} which is still running")
+                raise HTTPException(
+                    status_code=202, 
+                    detail=f"Job {task_id} is still in progress"
+                )
+            elif job_status == JobStatus.FAILED:
+                logger.error(f"Validator requested result for failed job {task_id}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Job {task_id} failed during processing: {getattr(job, 'error_message', 'Unknown error')}"
+                )
+        
+        # Continue with trying to find the config file
         # Try YAML config first (text tasks)
         config_filename = f"{task_id}.yml"
         config_path = os.path.join(cst.CONFIG_DIR, config_filename)
+        
         if os.path.exists(config_path):
-            with open(config_path, "r") as file:
-                config_data = yaml.safe_load(file)
-                return config_data.get("hub_model_id", None)
-        else:
-            # Try TOML config next (diffusion tasks)
-            config_filename = f"{task_id}.toml"
-            config_path = os.path.join(cst.CONFIG_DIR, config_filename)
-            with open(config_path, "r") as file:
-                config_data = toml.load(file)
-                return config_data.get("huggingface_repo_id", None)
+            try:
+                with open(config_path, "r") as file:
+                    config_data = yaml.safe_load(file)
+                    repo_id = config_data.get("hub_model_id", None)
+                    if repo_id:
+                        logger.info(f"Found submission for task {task_id} in YAML config: {repo_id}")
+                        return repo_id
+                    else:
+                        logger.warning(f"YAML config exists for {task_id} but hub_model_id is missing")
+            except Exception as yaml_e:
+                logger.error(f"Error reading YAML config for {task_id}: {yaml_e}")
+        
+        # Try TOML config next (diffusion tasks)
+        config_filename = f"{task_id}.toml"
+        config_path = os.path.join(cst.CONFIG_DIR, config_filename)
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as file:
+                    config_data = toml.load(file)
+                    repo_id = config_data.get("huggingface_repo_id", None)
+                    if repo_id:
+                        logger.info(f"Found submission for task {task_id} in TOML config: {repo_id}")
+                        return repo_id
+                    else:
+                        logger.warning(f"TOML config exists for {task_id} but huggingface_repo_id is missing")
+            except Exception as toml_e:
+                logger.error(f"Error reading TOML config for {task_id}: {toml_e}")
+                
+        # If we reach here, no config file was found or both configs lack repo ID
+        logger.error(f"No valid submission found for task {task_id}")
+        msg = f"No model submission found for task {task_id}"
+        
+        # Add helpful context if we know anything about this job
+        if job_status:
+            msg += f" (job status: {job_status})"
+            
+        raise HTTPException(status_code=404, detail=msg)
 
-    except FileNotFoundError as e:
-        logger.error(f"No submission found for task {task_id}: {str(e)}")
-        raise HTTPException(status_code=404, detail=f"No model submission found for task {task_id}")
+    except HTTPException:
+        # Re-raise HTTP exceptions so we don't wrap them
+        raise
     except Exception as e:
         logger.error(f"Error retrieving latest model submission for task {task_id}: {str(e)}")
         raise HTTPException(
