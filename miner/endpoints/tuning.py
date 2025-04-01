@@ -32,6 +32,13 @@ from miner.logic.job_handler import create_job_text
 logger = get_logger(__name__)
 
 current_job_finish_time = None
+# Track acceptable hours to complete for different model types
+MAX_TEXT_TASK_HOURS = int(os.getenv("MAX_TEXT_TASK_HOURS", "12"))
+MAX_IMAGE_TASK_HOURS = int(os.getenv("MAX_IMAGE_TASK_HOURS", "3"))
+# Track acceptable model families
+ACCEPTED_MODEL_FAMILIES = os.getenv("ACCEPTED_MODEL_FAMILIES", "llama,mistral").lower().split(",")
+# Track queue capacity
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "5"))
 
 
 async def tune_model_text(
@@ -99,12 +106,9 @@ async def tune_model_diffusion(
     return {"message": "Training job enqueued.", "task_id": job.job_id}
 
 
-# I think we need to be v careful that it's validators that are asking for this,
-# is there a way to ensure we only reply to validators?
 async def get_latest_model_submission(task_id: str) -> str:
     try:
-        # Temporary work around in order to not change the vali a lot
-        # Could send the task type from vali instead of matching file names
+        # Try YAML config first (text tasks)
         config_filename = f"{task_id}.yml"
         config_path = os.path.join(cst.CONFIG_DIR, config_filename)
         if os.path.exists(config_path):
@@ -112,6 +116,7 @@ async def get_latest_model_submission(task_id: str) -> str:
                 config_data = yaml.safe_load(file)
                 return config_data.get("hub_model_id", None)
         else:
+            # Try TOML config next (diffusion tasks)
             config_filename = f"{task_id}.toml"
             config_path = os.path.join(cst.CONFIG_DIR, config_filename)
             with open(config_path, "r") as file:
@@ -135,24 +140,60 @@ async def task_offer(
     worker_config: WorkerConfig = Depends(get_worker_config),
 ) -> MinerTaskResponse:
     try:
-        logger.info("An offer has come through")
-        # You will want to optimise this as a miner
-        global current_job_finish_time
-        current_time = datetime.now()
+        logger.info(f"Text task offer received: {request}")
+        
+        # Basic validation
         if request.task_type != TaskType.TEXTTASK:
             return MinerTaskResponse(message="This endpoint only accepts text tasks", accepted=False)
 
-        if "llama" not in request.model.lower():
-            return MinerTaskResponse(message="I'm not yet optimised and only accept llama-type jobs", accepted=False)
+        # Check if we're already at capacity with the queue
+        queue_size = worker_config.trainer.job_queue.queue.qsize()
+        if queue_size >= MAX_QUEUE_SIZE:
+            logger.info(f"Rejecting offer due to queue capacity ({queue_size}/{MAX_QUEUE_SIZE})")
+            return MinerTaskResponse(
+                message=f"Queue at capacity ({queue_size}/{MAX_QUEUE_SIZE})", accepted=False
+            )
 
+        # Extract model family and check if we accept it
+        model_lower = request.model.lower()
+        model_family = None
+        for family in ACCEPTED_MODEL_FAMILIES:
+            if family in model_lower:
+                model_family = family
+                break
+                
+        if model_family is None:
+            logger.info(f"Rejecting offer for unsupported model family: {request.model}")
+            return MinerTaskResponse(
+                message=f"Only accepting these model families: {', '.join(ACCEPTED_MODEL_FAMILIES)}", 
+                accepted=False
+            )
+            
+        # Check if model has failed previously
+        if not worker_config.trainer.can_accept_model(request.model):
+            return MinerTaskResponse(
+                message=f"This model family has failed in previous attempts", 
+                accepted=False
+            )
+
+        # Check time constraints
+        global current_job_finish_time
+        current_time = datetime.now()
+        
+        # If no current job or current job is almost done, we can accept new ones
         if current_job_finish_time is None or current_time + timedelta(hours=1) > current_job_finish_time:
-            if request.hours_to_complete < 13:
-                logger.info("Accepting the offer - ty snr")
+            # Check if job can be completed in our acceptable time frame
+            if request.hours_to_complete <= MAX_TEXT_TASK_HOURS:
+                logger.info(f"Accepting text task offer for model family {model_family}")
                 return MinerTaskResponse(message=f"Yes. I can do {request.task_type} jobs", accepted=True)
             else:
-                logger.info("Rejecting offer")
-                return MinerTaskResponse(message="I only accept small jobs", accepted=False)
+                logger.info(f"Rejecting text task offer due to time constraints: {request.hours_to_complete}h > {MAX_TEXT_TASK_HOURS}h")
+                return MinerTaskResponse(
+                    message=f"I only accept jobs requiring {MAX_TEXT_TASK_HOURS}h or less (requested: {request.hours_to_complete}h)", 
+                    accepted=False
+                )
         else:
+            # We're busy with current job
             return MinerTaskResponse(
                 message=f"Currently busy with another job until {current_job_finish_time.isoformat()}",
                 accepted=False,
@@ -173,21 +214,46 @@ async def task_offer_image(
     worker_config: WorkerConfig = Depends(get_worker_config),
 ) -> MinerTaskResponse:
     try:
-        logger.info("An image offer has come through")
-        global current_job_finish_time
-        current_time = datetime.now()
-
+        logger.info(f"Image task offer received: {request}")
+        
+        # Basic validation
         if request.task_type != TaskType.IMAGETASK:
             return MinerTaskResponse(message="This endpoint only accepts image tasks", accepted=False)
 
+        # Check if we're already at capacity with the queue
+        queue_size = worker_config.trainer.job_queue.queue.qsize()
+        if queue_size >= MAX_QUEUE_SIZE:
+            logger.info(f"Rejecting offer due to queue capacity ({queue_size}/{MAX_QUEUE_SIZE})")
+            return MinerTaskResponse(
+                message=f"Queue at capacity ({queue_size}/{MAX_QUEUE_SIZE})", accepted=False
+            )
+            
+        # Check if diffusion model is in acceptable list - simplifying here, we accept all diffusion models
+        # For production you'd want to filter like we do for text models
+        if not worker_config.trainer.can_accept_model(request.model):
+            return MinerTaskResponse(
+                message=f"This model family has failed in previous attempts", 
+                accepted=False
+            )
+
+        # Check time constraints
+        global current_job_finish_time
+        current_time = datetime.now()
+        
+        # If no current job or current job is almost done, we can accept new ones
         if current_job_finish_time is None or current_time + timedelta(hours=1) > current_job_finish_time:
-            if request.hours_to_complete < 3:
-                logger.info("Accepting the image offer")
+            # Check if job can be completed in our acceptable time frame
+            if request.hours_to_complete <= MAX_IMAGE_TASK_HOURS:
+                logger.info("Accepting image task offer")
                 return MinerTaskResponse(message="Yes. I can do image jobs", accepted=True)
             else:
-                logger.info("Rejecting offer - too long")
-                return MinerTaskResponse(message="I only accept small jobs", accepted=False)
+                logger.info(f"Rejecting image task offer due to time constraints: {request.hours_to_complete}h > {MAX_IMAGE_TASK_HOURS}h")
+                return MinerTaskResponse(
+                    message=f"I only accept jobs requiring {MAX_IMAGE_TASK_HOURS}h or less (requested: {request.hours_to_complete}h)", 
+                    accepted=False
+                )
         else:
+            # We're busy with current job
             return MinerTaskResponse(
                 message=f"Currently busy with another job until {current_job_finish_time.isoformat()}",
                 accepted=False,
@@ -233,7 +299,7 @@ def factory_router() -> APIRouter:
         dependencies=[Depends(blacklist_low_stake)],
     )
     router.add_api_route(
-        "/start_training/",  # TODO: change to /start_training_text or similar
+        "/start_training/",
         tune_model_text,
         tags=["Subnet"],
         methods=["POST"],
