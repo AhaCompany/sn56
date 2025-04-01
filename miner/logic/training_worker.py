@@ -303,53 +303,78 @@ class TrainingWorker:
                 # Check if any jobs are stuck
                 with self.lock:
                     try:
-                        for job_id, job in list(self.job_store.items()):  # Use list() to safely iterate
-                            # Safely check job status
-                            status = getattr(job, 'status', None)
-                            # Check if job is in running_jobs dictionary
-                            is_in_running_jobs = job_id in self.job_queue.running_jobs
-                            
-                            # If we can't get the status, log and continue
-                            if status is None:
-                                log_diagnostic(f"Job {job_id} has no status attribute", "WARNING")
-                                continue
+                        # Get safe copy of all jobs
+                        all_jobs = []
+                        try:
+                            all_jobs = [(job_id, job) for job_id, job in self.job_store.items()]
+                        except Exception as e:
+                            log_diagnostic(f"Error getting job list: {e}", "ERROR", include_trace=True)
+                        
+                        # Process each job individually with error handling for each
+                        for job_id, job in all_jobs:
+                            try:
+                                # Check if job has a status attribute
+                                if not hasattr(job, 'status'):
+                                    log_diagnostic(f"Job {job_id} has no status attribute", "WARNING")
+                                    continue
                                 
-                            # Convert status to string for comparison if it's not already a string
-                            status_str = str(status)
-                            
-                            # If a job has been in PROCESSING state for more than 1 hour, something might be wrong
-                            if (status_str == "PROCESSING" or status_str == JobStatus.PROCESSING and 
-                                is_in_running_jobs and
-                                time.time() - self.job_queue.running_jobs[job_id]["start_time"] > 3600):
+                                # Check if job is in running_jobs dictionary
+                                is_in_running_jobs = job_id in self.job_queue.running_jobs
                                 
-                                stuck_msg = f"Job {job_id} appears to be stuck in {status_str} state for >1 hour"
-                                log_diagnostic(stuck_msg, "WARNING")
-                                logger.warning(stuck_msg)
-                                
-                                # Attempt to fix the situation
+                                # Get status safely
                                 try:
-                                    # Reset active jobs count if needed
-                                    if self.active_jobs > 0:
-                                        reset_msg = f"Resetting active_jobs count from {self.active_jobs} to 0"
-                                        log_diagnostic(reset_msg, "WARNING")
-                                        logger.warning(reset_msg)
-                                        self.active_jobs = 0
-                                        
-                                    # Release semaphore if needed
+                                    status_value = job.status
+                                    # Convert to string for safer comparison
+                                    status_str = str(status_value)
+                                except Exception as inner_e:
+                                    log_diagnostic(f"Error accessing status for job {job_id}: {inner_e}", "WARNING")
+                                    continue
+                                
+                                # Check if job has been running too long
+                                if is_in_running_jobs:
                                     try:
-                                        self.job_semaphore.release()
-                                        log_diagnostic("Released job semaphore to unblock worker threads", "WARNING")
-                                        logger.warning("Released job semaphore to unblock worker threads")
-                                    except ValueError:
-                                        # If semaphore was already at max value, a ValueError will be raised
-                                        log_diagnostic("Semaphore already at max value, no release needed", "WARNING")
+                                        start_time = self.job_queue.running_jobs[job_id].get("start_time", 0)
+                                        running_time = time.time() - start_time
                                         
-                                except Exception as e:
-                                    error_msg = f"Error resetting worker state: {e}"
-                                    log_diagnostic(error_msg, "ERROR", include_trace=True)
-                                    logger.error(error_msg)
+                                        # Check for stuck jobs (job in Running status for >1 hour)
+                                        # Compare status with both string value "Running" and enum JobStatus.RUNNING
+                                        is_running = (status_str == "Running" or 
+                                                     status_str == str(JobStatus.RUNNING) or
+                                                     (hasattr(job.status, "value") and job.status.value == "Running"))
+                                        
+                                        if running_time > 3600 and is_running:
+                                            stuck_msg = f"Job {job_id} appears to be stuck in {status_str} state for >{int(running_time/60)} minutes"
+                                            log_diagnostic(stuck_msg, "WARNING")
+                                            logger.warning(stuck_msg)
+                                            
+                                            # Attempt to fix the situation
+                                            try:
+                                                # Reset active jobs count if needed
+                                                if self.active_jobs > 0:
+                                                    reset_msg = f"Resetting active_jobs count from {self.active_jobs} to 0"
+                                                    log_diagnostic(reset_msg, "WARNING")
+                                                    logger.warning(reset_msg)
+                                                    self.active_jobs = 0
+                                                    
+                                                # Release semaphore if needed
+                                                try:
+                                                    self.job_semaphore.release()
+                                                    log_diagnostic("Released job semaphore to unblock worker threads", "WARNING")
+                                                    logger.warning("Released job semaphore to unblock worker threads")
+                                                except ValueError:
+                                                    # If semaphore was already at max value, a ValueError will be raised
+                                                    log_diagnostic("Semaphore already at max value, no release needed", "WARNING")
+                                                    
+                                            except Exception as reset_e:
+                                                error_msg = f"Error resetting worker state: {reset_e}"
+                                                log_diagnostic(error_msg, "ERROR", include_trace=True)
+                                                logger.error(error_msg)
+                                    except Exception as time_e:
+                                        log_diagnostic(f"Error checking job running time for {job_id}: {time_e}", "WARNING")
+                            except Exception as job_e:
+                                log_diagnostic(f"Error processing job {job_id} in watchdog: {job_e}", "WARNING", include_trace=True)
                     except Exception as e:
-                        error_msg = f"Error while checking job status: {e}"
+                        error_msg = f"General error while checking job status: {str(e)}"
                         log_diagnostic(error_msg, "ERROR", include_trace=True)
                         logger.error(error_msg)
                 
@@ -413,7 +438,7 @@ class TrainingWorker:
                 # Update job status and active job count
                 with self.lock:
                     self.active_jobs += 1
-                    job.status = JobStatus.PROCESSING
+                    job.status = JobStatus.RUNNING  # Use correct JobStatus.RUNNING instead of PROCESSING
                 
                 job_start_msg = f"Processing job {job.job_id} (model: {job.model}, {self.active_jobs}/{self.max_concurrent_jobs} active jobs)"
                 log_diagnostic(job_start_msg, "INFO")
@@ -423,13 +448,48 @@ class TrainingWorker:
                 success = False
                 
                 try:
+                    # First verify Docker is running and accessible
+                    try:
+                        # Check if Docker daemon is responsive
+                        docker_ping = self.docker_client.ping()
+                        if not docker_ping:
+                            raise Exception("Docker daemon not responding")
+                            
+                        # Check if any stale containers exist for this job
+                        containers = self.docker_client.containers.list(all=True)
+                        for container in containers:
+                            if job.job_id in container.name or job.job_id in str(container.labels):
+                                log_diagnostic(f"Found existing container for job {job.job_id}: {container.name}, status: {container.status}", "WARNING")
+                                # If container exists but is not running, remove it
+                                if container.status != "running":
+                                    log_diagnostic(f"Removing stale container {container.name} for job {job.job_id}", "WARNING")
+                                    try:
+                                        container.remove(force=True)
+                                    except Exception as e:
+                                        log_diagnostic(f"Error removing stale container: {e}", "WARNING")
+                    except Exception as docker_e:
+                        log_diagnostic(f"Error checking Docker status: {docker_e}", "ERROR", include_trace=True)
+                        raise Exception(f"Docker service issue: {docker_e}")
+                    
                     # Process job based on type
                     if isinstance(job, TextJob):
                         log_diagnostic(f"Starting text model tuning for job {job.job_id}", "INFO")
                         metrics = start_tuning_container(job)
+                        
+                        # Verify container was actually created and running
+                        containers = self.docker_client.containers.list()
+                        if not any(job.job_id in str(c.name) or job.job_id in str(c.labels) for c in containers):
+                            raise Exception("No running container found after starting training - container may have failed silently")
+                            
                     elif isinstance(job, DiffusionJob):
                         log_diagnostic(f"Starting diffusion model tuning for job {job.job_id}", "INFO")
                         metrics = start_tuning_container_diffusion(job)
+                        
+                        # Verify container was actually created and running
+                        containers = self.docker_client.containers.list()
+                        if not any(job.job_id in str(c.name) or job.job_id in str(c.labels) for c in containers):
+                            raise Exception("No running container found after starting training - container may have failed silently")
+                            
                     else:
                         error_msg = f"Unknown job type: {type(job)}"
                         log_diagnostic(error_msg, "ERROR")

@@ -141,11 +141,22 @@ def _get_model_family(model: str) -> str:
         return "mistral"
     elif "phi" in model_lower:
         return "phi"
+    elif "qwen" in model_lower:
+        return "qwen"
+    elif "samoline" in model_lower:
+        return "samoline"
     elif "stable-diffusion" in model_lower:
         return "stable-diffusion"
     elif "sdxl" in model_lower:
         return "sdxl"
     else:
+        # Special handling for organization-based patterns
+        splits = model_lower.split('/')
+        if len(splits) > 1:
+            org = splits[0]
+            if org == "samoline":
+                return "samoline"
+    
         return "default"
 
 
